@@ -268,6 +268,10 @@ function readBoolean(value) {
   return finalValue === "true" || finalValue === true;
 }
 
+function isAutoApprovalTransactionId(value) {
+  return /^(?=.*[a-z])(?=.*\d)[a-z0-9]{10}$/i.test(String(value || "").trim());
+}
+
 app.get("/api/health", (_req, res) => {
   const db = getDbStatus();
   res.json({ ok: true, db: db.label, dbConnected: db.connected, time: new Date().toISOString() });
@@ -361,16 +365,25 @@ app.post("/api/manual-orders", async (req, res) => {
   }
 
   const settings = await getSettings();
+  const cleanTransactionId = String(transactionId || "").trim().toUpperCase();
+  const shouldAutoApprove = isAutoApprovalTransactionId(cleanTransactionId);
   const order = await Order.create({
     name,
     phone,
     email,
     method: paymentMethod,
-    transactionId,
+    transactionId: cleanTransactionId,
     amount: Number(amount || settings.ebook.price),
     orderBump: Boolean(orderBump),
-    paymentPayload: { items: Array.isArray(items) ? items : [] }
+    paymentPayload: { items: Array.isArray(items) ? items : [] },
+    status: shouldAutoApprove ? "approved" : "pending"
   });
+
+  if (shouldAutoApprove) {
+    order.downloadToken = createDownloadToken(order.id);
+    await order.save();
+    await sendDeliveryForApprovedOrder(order, settings);
+  }
 
   res.status(201).json({ orderId: order.id, status: order.status });
 });
@@ -384,6 +397,7 @@ app.get("/api/orders/:id/payment-status", async (req, res) => {
     orderId: order.id,
     status: order.status,
     invoiceId: order.paymentInvoiceId,
+    customerEmail: order.email,
     downloadReady,
     downloadUrl: downloadReady ? `${backendUrl}/api/download/${order.downloadToken}` : ""
   });
