@@ -603,6 +603,12 @@ app.put("/api/admin/settings", requireAdmin, upload.fields([
   { name: "v2VideoTestimonialImage3", maxCount: 1 },
   { name: "v2VideoTestimonialImage4", maxCount: 1 },
   { name: "v2VideoTestimonialImage5", maxCount: 1 },
+  { name: "v2ReviewImage0", maxCount: 1 },
+  { name: "v2ReviewImage1", maxCount: 1 },
+  { name: "v2ReviewImage2", maxCount: 1 },
+  { name: "v2ReviewImage3", maxCount: 1 },
+  { name: "v2ReviewImage4", maxCount: 1 },
+  { name: "v2ReviewImage5", maxCount: 1 },
   { name: "upsellFile0", maxCount: 1 },
   { name: "upsellFile1", maxCount: 1 },
   { name: "upsellFile2", maxCount: 1 },
@@ -702,6 +708,13 @@ app.put("/api/admin/settings", requireAdmin, upload.fields([
     const url = await uploadIfPresent(req, `v2VideoTestimonialImage${index}`);
     if (url && content.v2.videoTestimonials?.[index]) {
       content.v2.videoTestimonials[index].imageUrl = url;
+    }
+  }
+
+  for (let index = 0; index < 6; index += 1) {
+    const url = await uploadIfPresent(req, `v2ReviewImage${index}`);
+    if (url && content.v2.reviews?.[index]) {
+      content.v2.reviews[index].imageUrl = url;
     }
   }
 
