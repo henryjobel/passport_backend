@@ -1,0 +1,769 @@
+import cors from "cors";
+import dotenv from "dotenv";
+import express from "express";
+import { randomUUID } from "node:crypto";
+import jwt from "jsonwebtoken";
+import { isValidObjectId } from "mongoose";
+import multer from "multer";
+
+import { connectDb, getDbStatus } from "./db.js";
+import { getSettings } from "./models/Settings.js";
+import { Product } from "./models/Product.js";
+import { Order } from "./models/Order.js";
+import { AdminUser, ensureAdminUser, verifyPassword } from "./models/AdminUser.js";
+import { mergeContent } from "./defaultContent.js";
+import { uploadImage, uploadPrivateFile, uploadVideo, getSignedFileUrl } from "./lib/cloudinary.js";
+import { sendEbookDeliveryEmail } from "./lib/email.js";
+
+dotenv.config();
+
+const app = express();
+const port = Number(process.env.PORT || 5000);
+const jwtSecret = process.env.JWT_SECRET || "dev-secret";
+const isProduction = process.env.NODE_ENV === "production";
+const defaultProductionBackendUrl = "https://ebook-backend-one.vercel.app";
+const backendUrl = process.env.BACKEND_URL || (isProduction ? defaultProductionBackendUrl : `http://localhost:${port}`);
+const configuredAllowedOrigins = String(process.env.CLIENT_URL || process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const allowedOrigins = [...new Set([
+  ...configuredAllowedOrigins,
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:3000"
+])];
+
+function isLocalDevOrigin(origin) {
+  try {
+    return origin && ["localhost", "127.0.0.1"].includes(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || isLocalDevOrigin(origin) || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error("Not allowed by CORS"));
+  }
+}));
+app.use(express.json({ limit: "2mb" }));
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 60 * 1024 * 1024 }
+});
+
+function publicEbook(ebook) {
+  return {
+    title: ebook.title,
+    subtitle: ebook.subtitle,
+    description: ebook.description,
+    price: ebook.price,
+    originalPrice: ebook.originalPrice,
+    coverUrl: ebook.coverUrl,
+    hasFile: Boolean(ebook.filePublicId)
+  };
+}
+
+function requireAdmin(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ message: "লগইন প্রয়োজন" });
+
+  try {
+    req.admin = jwt.verify(token, jwtSecret);
+    next();
+  } catch {
+    res.status(401).json({ message: "সেশন শেষ হয়েছে, আবার লগইন করুন" });
+  }
+}
+
+function createDownloadToken(orderId, upsellId = "") {
+  const payload = { orderId, purpose: "download" };
+  if (upsellId) payload.upsellId = String(upsellId);
+  return jwt.sign(payload, jwtSecret, {
+    expiresIn: "7d"
+  });
+}
+
+async function collectPurchasedUpsells(order, settings) {
+  const items = Array.isArray(order.paymentPayload?.items) ? order.paymentPayload.items : [];
+  const cmsUpsells = mergeContent(settings.content).v2?.upsells || [];
+  const upsellItems = [];
+
+  for (const item of items) {
+    const itemId = String(item?.id || "");
+    if (!itemId || itemId === "main-ebook") continue;
+
+    const cmsUpsell = cmsUpsells.find((upsell) => String(upsell.id) === itemId);
+    if (cmsUpsell) {
+      upsellItems.push({
+        title: cmsUpsell.title || item.title || "অতিরিক্ত প্রোডাক্ট",
+        downloadUrl: cmsUpsell.filePublicId
+          ? `${backendUrl}/api/download/${createDownloadToken(order.id, itemId)}`
+          : ""
+      });
+      continue;
+    }
+
+    if (!isValidObjectId(itemId)) continue;
+    const product = await Product.findById(itemId);
+    // Skip the main product — its file is already the primary delivery.
+    if (!product || !product.isUpsell) continue;
+    upsellItems.push({
+      title: product.title || item.title || "অতিরিক্ত প্রোডাক্ট",
+      downloadUrl: product.filePublicId
+        ? `${backendUrl}/api/download/${createDownloadToken(order.id, itemId)}`
+        : ""
+    });
+  }
+
+  return upsellItems;
+}
+
+async function resolveUpsellFileSource(settings, upsellId) {
+  const cmsUpsell = (mergeContent(settings.content).v2?.upsells || [])
+    .find((item) => String(item.id) === String(upsellId));
+  if (cmsUpsell?.filePublicId) {
+    return {
+      title: cmsUpsell.title,
+      filePublicId: cmsUpsell.filePublicId,
+      fileFormat: inferFileFormat(cmsUpsell),
+      fileResourceType: cmsUpsell.fileResourceType,
+      originalFileName: cmsUpsell.originalFileName
+    };
+  }
+
+  if (!isValidObjectId(upsellId)) return null;
+  const product = await Product.findById(upsellId);
+  if (!product?.filePublicId) return null;
+  return {
+    title: product.title,
+    filePublicId: product.filePublicId,
+    fileFormat: inferFileFormat(product),
+    fileResourceType: product.fileResourceType,
+    originalFileName: product.originalFileName
+  };
+}
+
+async function sendDeliveryForApprovedOrder(order, settings) {
+  if (!order.email) {
+    console.warn(`Order ${order.id} has no customer email — delivery email skipped`);
+    return;
+  }
+
+  const content = mergeContent(settings.content);
+  const downloadUrl = `${backendUrl}/api/download/${order.downloadToken}`;
+  let attachment = null;
+  let downloadFile = null;
+  try {
+    downloadFile = await getDownloadFileSource(settings, order);
+    if (downloadFile?.filePublicId) {
+      attachment = {
+        fileName: downloadFileName(downloadFile),
+        url: getSignedFileUrl(downloadFile.filePublicId, downloadFile.fileFormat, downloadFile.fileResourceType)
+      };
+    }
+  } catch (error) {
+    console.error("Could not prepare ebook attachment:", error);
+  }
+
+  let upsellItems = [];
+  try {
+    upsellItems = await collectPurchasedUpsells(order, settings);
+  } catch (error) {
+    console.error("Could not prepare upsell delivery items:", error);
+  }
+
+  // Awaited on purpose: on serverless hosting (Vercel) the function freezes
+  // as soon as the response is sent, killing any fire-and-forget email.
+  try {
+    await sendEbookDeliveryEmail({
+      to: order.email,
+      customerName: order.name,
+      ebookTitle: downloadFile?.title || settings.ebook.title || "ebook",
+      brandName: content.v2?.brandName || content.brandName || "",
+      downloadUrl,
+      attachment,
+      upsellItems
+    });
+  } catch (error) {
+    console.error("Email send failed:", error);
+  }
+}
+
+function inferFileFormat(source) {
+  if (source.fileFormat) return source.fileFormat;
+  const name = source.originalFileName || source.filePublicId || "";
+  const match = String(name).match(/\.([a-z0-9]+)$/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
+function downloadFileName(source) {
+  const fallback = `${source.title || "ebook"}.pdf`;
+  const name = source.originalFileName || fallback;
+  return String(name)
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim() || "ebook.pdf";
+}
+
+function fileSource(source) {
+  if (!source?.filePublicId) return null;
+  return {
+    title: source.title,
+    filePublicId: source.filePublicId,
+    fileFormat: inferFileFormat(source),
+    fileResourceType: source.fileResourceType,
+    originalFileName: source.originalFileName
+  };
+}
+
+async function getDownloadFileSource(settings, order = null) {
+  // Checkout stores the purchased main product as the first order item.
+  // Resolve that product first so replacing its PDF in Edit Product also
+  // replaces the file delivered by both email and the secure download link.
+  const purchasedItems = Array.isArray(order?.paymentPayload?.items)
+    ? order.paymentPayload.items
+    : [];
+  const purchasedProductId = String(purchasedItems[0]?.id || "");
+
+  if (isValidObjectId(purchasedProductId)) {
+    const purchasedProduct = await Product.findOne({
+      _id: purchasedProductId,
+      type: "ebook",
+      isUpsell: { $ne: true },
+      filePublicId: { $ne: "" }
+    });
+    const purchasedFile = fileSource(purchasedProduct);
+    if (purchasedFile) return purchasedFile;
+  }
+
+  if (settings.ebook.filePublicId) {
+    return fileSource(settings.ebook);
+  }
+
+  const ebookProduct = await Product.findOne({
+    type: "ebook",
+    status: "active",
+    filePublicId: { $ne: "" }
+  }).sort({ createdAt: -1 });
+
+  return fileSource(ebookProduct);
+}
+
+async function uploadIfPresent(req, fieldName) {
+  const file = req.files?.[fieldName]?.[0];
+  if (!file) return null;
+  return uploadImage(file.buffer, "ebook-store");
+}
+
+function readBoolean(value) {
+  const finalValue = Array.isArray(value) ? value[value.length - 1] : value;
+  return finalValue === "true" || finalValue === true;
+}
+
+app.get("/api/health", (_req, res) => {
+  const db = getDbStatus();
+  res.json({ ok: true, db: db.label, dbConnected: db.connected, time: new Date().toISOString() });
+});
+
+app.get("/", (_req, res) => {
+  const db = getDbStatus();
+  const statusDot = (ok) => `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ok ? "#22c55e" : "#ef4444"};margin-right:8px"></span>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Ebook Backend Status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 40px 20px; }
+  .card { max-width: 560px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 28px 32px; box-shadow: 0 4px 20px rgba(0,0,0,.3); }
+  h1 { font-size: 20px; margin: 0 0 20px; }
+  .row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #334155; }
+  .row:last-child { border-bottom: none; }
+  .label { color: #94a3b8; font-size: 14px; }
+  .value { font-size: 14px; font-weight: 600; }
+  code { background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  ul { padding-left: 18px; margin: 8px 0 0; font-size: 13px; color: #94a3b8; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>📦 Ebook Backend Status</h1>
+    <div class="row">
+      <span class="label">API</span>
+      <span class="value">${statusDot(true)}Live</span>
+    </div>
+    <div class="row">
+      <span class="label">Database (MongoDB)</span>
+      <span class="value">${statusDot(db.connected)}${db.label}</span>
+    </div>
+    <div class="row">
+      <span class="label">Server time</span>
+      <span class="value">${new Date().toLocaleString()}</span>
+    </div>
+    <div class="row" style="border-bottom:none; flex-direction: column; align-items: flex-start;">
+      <span class="label" style="margin-bottom:6px">Quick check</span>
+      <ul>
+        <li><code>/api/health</code> — JSON status (api + db)</li>
+        <li><code>/api/ebook</code> — public ebook data</li>
+        <li><code>/api/products</code> — active products</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>`);
+});
+
+function publicContent(content) {
+  const safe = { ...content };
+  if (safe.v2?.upsells) {
+    safe.v2 = {
+      ...safe.v2,
+      upsells: safe.v2.upsells.map(({ filePublicId, fileFormat, fileResourceType, ...rest }) => ({
+        ...rest,
+        hasFile: Boolean(filePublicId)
+      }))
+    };
+  }
+  return safe;
+}
+
+app.get("/api/ebook", async (_req, res) => {
+  const settings = await getSettings();
+  // Never let a CDN or the browser serve a stale copy after the admin edits content.
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    ebook: publicEbook(settings.ebook),
+    payment: settings.payment,
+    content: publicContent(mergeContent(settings.content))
+  });
+});
+
+app.post("/api/manual-orders", async (req, res) => {
+  const { name, phone, email, method, transactionId, amount, orderBump, items } = req.body;
+  if (!name || !phone || !email || !transactionId) {
+    return res.status(400).json({ message: "নাম, ফোন, ইমেইল ও Transaction ID দিন" });
+  }
+
+  const paymentMethod = method || "bkash";
+  if (!["bkash", "nagad"].includes(paymentMethod)) {
+    return res.status(400).json({ message: "সঠিক পেমেন্ট মাধ্যম নির্বাচন করুন" });
+  }
+
+  const settings = await getSettings();
+  const order = await Order.create({
+    name,
+    phone,
+    email,
+    method: paymentMethod,
+    transactionId,
+    amount: Number(amount || settings.ebook.price),
+    orderBump: Boolean(orderBump),
+    paymentPayload: { items: Array.isArray(items) ? items : [] }
+  });
+
+  res.status(201).json({ orderId: order.id, status: order.status });
+});
+
+app.get("/api/orders/:id/payment-status", async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return res.status(404).json({ message: "Order not found" });
+
+  const downloadReady = order.status === "approved" && Boolean(order.downloadToken);
+  res.json({
+    orderId: order.id,
+    status: order.status,
+    invoiceId: order.paymentInvoiceId,
+    downloadReady,
+    downloadUrl: downloadReady ? `${backendUrl}/api/download/${order.downloadToken}` : ""
+  });
+});
+
+app.post("/api/admin/login", async (req, res) => {
+  const { email, password } = req.body;
+  const adminEmail = process.env.ADMIN_EMAIL || "admin@example.com";
+  const adminPassword = process.env.ADMIN_PASSWORD || "admin123";
+  const normalizedEmail = String(email || "").toLowerCase().trim();
+
+  await ensureAdminUser(adminEmail, adminPassword);
+  const admin = await AdminUser.findOne({ email: normalizedEmail });
+  const validDbAdmin = admin && verifyPassword(password, admin.passwordHash, admin.passwordSalt);
+  const validEnvFallback = normalizedEmail === adminEmail.toLowerCase().trim() && password === adminPassword;
+
+  if (!validDbAdmin && !validEnvFallback) {
+    return res.status(401).json({ message: "ইমেইল বা পাসওয়ার্ড সঠিক নয়" });
+  }
+
+  if (admin) {
+    admin.lastLoginAt = new Date();
+    await admin.save();
+  }
+
+  const token = jwt.sign(
+    {
+      sub: admin?.id || normalizedEmail,
+      email: normalizedEmail,
+      role: "admin"
+    },
+    jwtSecret,
+    { expiresIn: "12h" }
+  );
+  const settings = await getSettings();
+  res.json({
+    token,
+    ebook: settings.ebook,
+    payment: settings.payment,
+    content: mergeContent(settings.content)
+  });
+});
+
+app.get("/api/products", async (_req, res) => {
+  const products = await Product.find({ status: "active" }).sort({ createdAt: -1 });
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ products });
+});
+
+app.get("/api/admin/orders", requireAdmin, async (_req, res) => {
+  const orders = await Order.find().sort({ createdAt: -1 });
+  res.json({ orders });
+});
+
+app.delete("/api/admin/orders/:id", requireAdmin, async (req, res) => {
+  const order = await Order.findByIdAndDelete(req.params.id);
+  if (!order) return res.status(404).json({ message: "Order not found" });
+  res.json({ deleted: true, orderId: req.params.id });
+});
+
+app.get("/api/admin/products", requireAdmin, async (_req, res) => {
+  const products = await Product.find().sort({ createdAt: -1 });
+  res.json({ products });
+});
+
+app.post("/api/admin/products", requireAdmin, upload.fields([
+  { name: "productImage", maxCount: 1 },
+  { name: "productVideo", maxCount: 1 },
+  { name: "productFile", maxCount: 1 }
+]), async (req, res) => {
+  const { title, type, price, originalPrice, description, stock, sku, shippingCharge, deliveryOptions, deliveryNote, youtubeUrl, isUpsell } = req.body;
+
+  if (!title || !["ebook", "physical"].includes(type)) {
+    return res.status(400).json({ message: "Product title এবং type প্রয়োজন" });
+  }
+
+  const product = {
+    title,
+    type,
+    price: Number(price || 0),
+    originalPrice: Number(originalPrice || 0),
+    description: description || "",
+    stock: type === "physical" ? Number(stock || 0) : null,
+    sku: sku || "",
+    shippingCharge: type === "physical" ? Number(shippingCharge || 0) : 0,
+    deliveryOptions: type === "physical" ? String(deliveryOptions || "").split(",").map((item) => item.trim()).filter(Boolean) : ["Digital download"],
+    deliveryNote: deliveryNote || "",
+    youtubeUrl: youtubeUrl || "",
+    isUpsell: readBoolean(isUpsell),
+    status: "active"
+  };
+
+  const imageFile = req.files?.productImage?.[0];
+  if (imageFile) {
+    product.imageUrl = await uploadImage(imageFile.buffer, "ebook-store/products");
+  }
+
+  const videoFile = req.files?.productVideo?.[0];
+  if (videoFile) {
+    product.videoUrl = await uploadVideo(videoFile.buffer, "ebook-store/product-videos");
+  }
+
+  const productFile = req.files?.productFile?.[0];
+  if (productFile) {
+    const uploaded = await uploadPrivateFile(productFile.buffer, "ebook-store/files", productFile.originalname);
+    product.filePublicId = uploaded.publicId;
+    product.fileFormat = uploaded.format;
+    product.fileResourceType = uploaded.resourceType;
+    product.originalFileName = productFile.originalname;
+  }
+
+  const created = await Product.create(product);
+  res.status(201).json({ product: created });
+});
+
+app.patch("/api/admin/products/:id", requireAdmin, upload.fields([
+  { name: "productImage", maxCount: 1 },
+  { name: "productVideo", maxCount: 1 },
+  { name: "productFile", maxCount: 1 }
+]), async (req, res) => {
+  const product = await Product.findById(req.params.id);
+  if (!product) return res.status(404).json({ message: "Product পাওয়া যায়নি" });
+
+  const { title, price, originalPrice, description, stock, sku, shippingCharge, deliveryOptions, deliveryNote, youtubeUrl, isUpsell, status } = req.body;
+
+  if (title) product.title = title;
+  if (price !== undefined) product.price = Number(price);
+  if (originalPrice !== undefined) product.originalPrice = Number(originalPrice);
+  if (description !== undefined) product.description = description;
+  if (stock !== undefined && product.type === "physical") product.stock = Number(stock);
+  if (sku !== undefined) product.sku = sku;
+  if (shippingCharge !== undefined) product.shippingCharge = Number(shippingCharge);
+  if (deliveryOptions) product.deliveryOptions = String(deliveryOptions).split(",").map((x) => x.trim()).filter(Boolean);
+  if (deliveryNote !== undefined) product.deliveryNote = deliveryNote;
+  if (youtubeUrl !== undefined) product.youtubeUrl = youtubeUrl;
+  if (isUpsell !== undefined) product.isUpsell = readBoolean(isUpsell);
+  if (status && ["active", "draft", "archived"].includes(status)) product.status = status;
+
+  const imageFile = req.files?.productImage?.[0];
+  if (imageFile) {
+    product.imageUrl = await uploadImage(imageFile.buffer, "ebook-store/products");
+  }
+
+  const videoFile = req.files?.productVideo?.[0];
+  if (videoFile) {
+    product.videoUrl = await uploadVideo(videoFile.buffer, "ebook-store/product-videos");
+  }
+
+  const productFile = req.files?.productFile?.[0];
+  if (productFile) {
+    const uploaded = await uploadPrivateFile(productFile.buffer, "ebook-store/files", productFile.originalname);
+    product.filePublicId = uploaded.publicId;
+    product.fileFormat = uploaded.format;
+    product.fileResourceType = uploaded.resourceType;
+    product.originalFileName = productFile.originalname;
+  }
+
+  await product.save();
+  res.json({ product });
+});
+
+app.delete("/api/admin/products/:id", requireAdmin, async (req, res) => {
+  const product = await Product.findByIdAndDelete(req.params.id);
+  if (!product) return res.status(404).json({ message: "Product পাওয়া যায়নি" });
+  res.json({ ok: true });
+});
+
+app.get("/api/admin/settings", requireAdmin, async (_req, res) => {
+  const settings = await getSettings();
+  res.json({
+    ebook: settings.ebook,
+    payment: settings.payment,
+    content: mergeContent(settings.content)
+  });
+});
+
+app.put("/api/admin/settings", requireAdmin, upload.fields([
+  { name: "ebookFile", maxCount: 1 },
+  { name: "coverImage", maxCount: 1 },
+  { name: "logoImage", maxCount: 1 },
+  { name: "faviconImage", maxCount: 1 },
+  { name: "seoImage", maxCount: 1 },
+  { name: "heroBannerImage", maxCount: 1 },
+  { name: "authorImage", maxCount: 1 },
+  { name: "guaranteeImage", maxCount: 1 },
+  { name: "testimonialImage0", maxCount: 1 },
+  { name: "testimonialImage1", maxCount: 1 },
+  { name: "testimonialImage2", maxCount: 1 },
+  { name: "testimonialImage3", maxCount: 1 },
+  { name: "testimonialImage4", maxCount: 1 },
+  { name: "testimonialImage5", maxCount: 1 },
+  { name: "customSectionImage0", maxCount: 1 },
+  { name: "customSectionImage1", maxCount: 1 },
+  { name: "customSectionImage2", maxCount: 1 },
+  { name: "customSectionImage3", maxCount: 1 },
+  { name: "customSectionImage4", maxCount: 1 },
+  { name: "customSectionImage5", maxCount: 1 },
+  { name: "v2AuthorImage", maxCount: 1 },
+  { name: "v2VideoTestimonialImage0", maxCount: 1 },
+  { name: "v2VideoTestimonialImage1", maxCount: 1 },
+  { name: "v2VideoTestimonialImage2", maxCount: 1 },
+  { name: "v2VideoTestimonialImage3", maxCount: 1 },
+  { name: "v2VideoTestimonialImage4", maxCount: 1 },
+  { name: "v2VideoTestimonialImage5", maxCount: 1 },
+  { name: "upsellFile0", maxCount: 1 },
+  { name: "upsellFile1", maxCount: 1 },
+  { name: "upsellFile2", maxCount: 1 },
+  { name: "upsellFile3", maxCount: 1 },
+  { name: "upsellFile4", maxCount: 1 },
+  { name: "upsellFile5", maxCount: 1 }
+]), async (req, res) => {
+  const settings = await getSettings();
+  const { title, subtitle, description, price, originalPrice, bkashNumber, nagadNumber, instructions, contentJson } = req.body;
+
+  settings.ebook.title = title || settings.ebook.title;
+  settings.ebook.subtitle = subtitle || settings.ebook.subtitle;
+  settings.ebook.description = description || settings.ebook.description;
+  settings.ebook.price = Number(price || settings.ebook.price);
+  settings.ebook.originalPrice = Number(originalPrice || settings.ebook.originalPrice);
+
+  const ebookFile = req.files?.ebookFile?.[0];
+  if (ebookFile) {
+    const uploaded = await uploadPrivateFile(ebookFile.buffer, "ebook-store/files", ebookFile.originalname);
+    settings.ebook.filePublicId = uploaded.publicId;
+    settings.ebook.fileFormat = uploaded.format;
+    settings.ebook.fileResourceType = uploaded.resourceType;
+    settings.ebook.originalFileName = ebookFile.originalname;
+  }
+
+  const coverUrl = await uploadIfPresent(req, "coverImage");
+  if (coverUrl) settings.ebook.coverUrl = coverUrl;
+
+  settings.payment.bkashNumber = bkashNumber || settings.payment.bkashNumber;
+  settings.payment.nagadNumber = nagadNumber || settings.payment.nagadNumber;
+  settings.payment.instructions = instructions || settings.payment.instructions;
+
+  let content = mergeContent(settings.content);
+  if (contentJson) {
+    try {
+      content = mergeContent(JSON.parse(contentJson));
+    } catch {
+      return res.status(400).json({ message: "Content JSON সঠিক নয়" });
+    }
+  }
+
+  const logoUrl = await uploadIfPresent(req, "logoImage");
+  if (logoUrl) {
+    content.logoUrl = logoUrl;
+    // The storefront header prefers v2.logoUrl, so a stale value there would
+    // keep showing the old logo after reload — always update both.
+    content.v2.logoUrl = logoUrl;
+  }
+
+  const faviconUrl = await uploadIfPresent(req, "faviconImage");
+  if (faviconUrl) content.faviconUrl = faviconUrl;
+
+  const seoImageUrl = await uploadIfPresent(req, "seoImage");
+  if (seoImageUrl) content.seoImageUrl = seoImageUrl;
+
+  const heroBannerUrl = await uploadIfPresent(req, "heroBannerImage");
+  if (heroBannerUrl) content.heroBannerUrl = heroBannerUrl;
+
+  const authorPhotoUrl = await uploadIfPresent(req, "authorImage");
+  if (authorPhotoUrl) content.authorPhotoUrl = authorPhotoUrl;
+
+  const guaranteeBadgeUrl = await uploadIfPresent(req, "guaranteeImage");
+  if (guaranteeBadgeUrl) content.guaranteeBadgeUrl = guaranteeBadgeUrl;
+
+  for (let index = 0; index < 6; index += 1) {
+    const url = await uploadIfPresent(req, `testimonialImage${index}`);
+    if (url && content.testimonials?.[index]) {
+      content.testimonials[index].imageUrl = url;
+    }
+  }
+
+  for (let index = 0; index < 6; index += 1) {
+    const url = await uploadIfPresent(req, `customSectionImage${index}`);
+    if (url && content.customSections?.[index]) {
+      content.customSections[index].imageUrl = url;
+    }
+  }
+
+  const v2AuthorPhotoUrl = await uploadIfPresent(req, "v2AuthorImage");
+  if (v2AuthorPhotoUrl) content.v2.author.photoUrl = v2AuthorPhotoUrl;
+
+  for (let index = 0; index < 6; index += 1) {
+    const upsellFile = req.files?.[`upsellFile${index}`]?.[0];
+    if (upsellFile && content.v2.upsells?.[index]) {
+      const uploaded = await uploadPrivateFile(upsellFile.buffer, "ebook-store/upsell-files", upsellFile.originalname);
+      content.v2.upsells[index] = {
+        ...content.v2.upsells[index],
+        filePublicId: uploaded.publicId,
+        fileFormat: uploaded.format,
+        fileResourceType: uploaded.resourceType,
+        originalFileName: upsellFile.originalname
+      };
+    }
+  }
+
+  for (let index = 0; index < 6; index += 1) {
+    const url = await uploadIfPresent(req, `v2VideoTestimonialImage${index}`);
+    if (url && content.v2.videoTestimonials?.[index]) {
+      content.v2.videoTestimonials[index].imageUrl = url;
+    }
+  }
+
+  settings.content = content;
+  settings.markModified("ebook");
+  settings.markModified("payment");
+  settings.markModified("content");
+  await settings.save();
+
+  res.json({
+    ebook: settings.ebook,
+    payment: settings.payment,
+    content: mergeContent(settings.content)
+  });
+});
+
+app.patch("/api/admin/orders/:id", requireAdmin, async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return res.status(404).json({ message: "অর্ডার পাওয়া যায়নি" });
+
+  const status = req.body.status || order.status;
+  if (!["approved", "rejected", "pending"].includes(status)) {
+    return res.status(400).json({ message: "সঠিক স্ট্যাটাস দিন" });
+  }
+
+  const wasAlreadyApproved = order.status === "approved";
+  order.status = status;
+  if (req.body.deliveryStatus) order.deliveryStatus = req.body.deliveryStatus;
+  if (typeof req.body.trackingNumber === "string") order.trackingNumber = req.body.trackingNumber;
+  if (typeof req.body.deliveryNote === "string") order.deliveryNote = req.body.deliveryNote;
+  order.downloadToken = status === "approved" ? createDownloadToken(order.id) : "";
+  await order.save();
+
+  if (status === "approved" && !wasAlreadyApproved) {
+    const settings = await getSettings();
+    await sendDeliveryForApprovedOrder(order, settings);
+  }
+
+  res.json({ order });
+});
+
+app.get("/api/download/:token", async (req, res) => {
+  let payload;
+  try {
+    payload = jwt.verify(req.params.token, jwtSecret);
+  } catch {
+    return res.status(401).send("Download link expired");
+  }
+
+  if (payload.purpose !== "download") {
+    return res.status(401).send("Invalid download link");
+  }
+
+  const order = await Order.findById(payload.orderId);
+  const settings = await getSettings();
+  const downloadFile = payload.upsellId
+    ? await resolveUpsellFileSource(settings, payload.upsellId)
+    : await getDownloadFileSource(settings, order);
+  if (!order || order.status !== "approved" || !downloadFile?.filePublicId) {
+    return res.status(403).send("Download not available");
+  }
+
+  const signedUrl = getSignedFileUrl(
+    downloadFile.filePublicId,
+    downloadFile.fileFormat,
+    downloadFile.fileResourceType
+  );
+
+  // Redirect to the short-lived signed Cloudinary URL instead of proxying the
+  // file: serverless hosting (Vercel) caps response bodies at ~4.5MB, which
+  // silently breaks downloads of any real-sized ebook.
+  res.setHeader("Cache-Control", "private, no-store");
+  res.redirect(302, signedUrl);
+});
+
+connectDb().then(() => {
+  app.listen(port, () => {
+    console.log(`Ebook backend running on http://localhost:${port}`);
+  });
+});
