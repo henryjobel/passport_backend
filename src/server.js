@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import jwt from "jsonwebtoken";
 import { isValidObjectId } from "mongoose";
 import multer from "multer";
+import { AlipaySdk } from "alipay-sdk";
 
 import { connectDb, getDbStatus } from "./db.js";
 import { getSettings } from "./models/Settings.js";
@@ -23,6 +24,8 @@ const jwtSecret = process.env.JWT_SECRET || "dev-secret";
 const isProduction = process.env.NODE_ENV === "production";
 const defaultProductionBackendUrl = "https://passport-backend-khaki.vercel.app";
 const backendUrl = process.env.BACKEND_URL || (isProduction ? defaultProductionBackendUrl : `http://localhost:${port}`);
+const storefrontUrl = process.env.FRONTEND_URL || process.env.CLIENT_URL || "http://localhost:5173";
+const storeCurrency = String(process.env.STORE_CURRENCY || "USD").toUpperCase();
 const configuredAllowedOrigins = String(process.env.CLIENT_URL || process.env.FRONTEND_URL || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -59,6 +62,67 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 60 * 1024 * 1024 }
 });
+
+function paymentConfig(settings) {
+  return { ...settings.payment.toObject(), alipayEnabled: isAlipayConfigured(), currency: storeCurrency };
+}
+
+function formatAlipayKey(value, label) {
+  const key = String(value || "").trim().replace(/\\n/g, "\n");
+  if (!key) return "";
+  if (key.includes("-----BEGIN")) return key;
+  const body = key.replace(/\s/g, "");
+  return `-----BEGIN ${label}-----\n${body.match(/.{1,64}/g)?.join("\n") || body}\n-----END ${label}-----`;
+}
+
+function isAlipayConfigured() {
+  const appId = String(process.env.ALIPAY_APP_ID || "").trim();
+  const privateKey = formatAlipayKey(process.env.ALIPAY_PRIVATE_KEY, "PRIVATE KEY");
+  const alipayPublicKey = formatAlipayKey(process.env.ALIPAY_PUBLIC_KEY, "PUBLIC KEY");
+  // A public key is required to verify Alipay's callback. Rejecting a private
+  // key here prevents a common configuration error from falsely enabling checkout.
+  return Boolean(
+    appId &&
+    privateKey.includes("BEGIN PRIVATE KEY") &&
+    alipayPublicKey.includes("BEGIN PUBLIC KEY") &&
+    !alipayPublicKey.includes("BEGIN PRIVATE KEY")
+  );
+}
+
+function getAlipayClient() {
+  if (!isAlipayConfigured()) return null;
+  return new AlipaySdk({
+    appId: process.env.ALIPAY_APP_ID,
+    privateKey: formatAlipayKey(process.env.ALIPAY_PRIVATE_KEY, "PRIVATE KEY"),
+    alipayPublicKey: formatAlipayKey(process.env.ALIPAY_PUBLIC_KEY, "PUBLIC KEY"),
+    signType: "RSA2",
+    gateway: process.env.ALIPAY_GATEWAY || "https://openapi.alipay.com/gateway.do"
+  });
+}
+
+async function calculateOrderAmount(settings, items) {
+  const requestedItems = Array.isArray(items) ? items : [];
+  if (!requestedItems.length) return Number(settings.ebook.price || 0);
+
+  let total = 0;
+  for (const item of requestedItems) {
+    const itemId = String(item?.id || "");
+    if (isValidObjectId(itemId)) {
+      const product = await Product.findOne({ _id: itemId, status: "active" });
+      if (product) {
+        total += Number(product.price || 0);
+        continue;
+      }
+    }
+    if (itemId === "main-ebook") {
+      total += Number(settings.ebook.price || 0);
+      continue;
+    }
+    const upsell = (mergeContent(settings.content).v2?.upsells || []).find((entry) => String(entry.id) === itemId);
+    if (upsell) total += Number(upsell.price || 0);
+  }
+  return Number(total.toFixed(2));
+}
 
 function publicEbook(ebook) {
   return {
@@ -349,7 +413,7 @@ app.get("/api/ebook", async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json({
     ebook: publicEbook(settings.ebook),
-    payment: settings.payment,
+    payment: paymentConfig(settings),
     content: publicContent(mergeContent(settings.content))
   });
 });
@@ -374,7 +438,7 @@ app.post("/api/manual-orders", async (req, res) => {
     email,
     method: paymentMethod,
     transactionId: cleanTransactionId,
-    amount: Number(amount || settings.ebook.price),
+    amount: await calculateOrderAmount(settings, items),
     orderBump: Boolean(orderBump),
     paymentPayload: { items: Array.isArray(items) ? items : [] },
     status: shouldAutoApprove ? "approved" : "pending"
@@ -387,6 +451,80 @@ app.post("/api/manual-orders", async (req, res) => {
   }
 
   res.status(201).json({ orderId: order.id, status: order.status });
+});
+
+app.post("/api/alipay/checkout", async (req, res) => {
+  const { name, phone, email, items, orderBump } = req.body;
+  const alipay = getAlipayClient();
+  if (!alipay) return res.status(503).json({ message: "Alipay is not configured yet" });
+  if (!name || !phone || !email) return res.status(400).json({ message: "Name, phone and email are required" });
+
+  const settings = await getSettings();
+  const safeItems = Array.isArray(items) ? items : [];
+  const amount = await calculateOrderAmount(settings, safeItems);
+  if (!Number.isFinite(amount) || amount < 0.01) return res.status(400).json({ message: "Invalid order total" });
+
+  const order = await Order.create({
+    name: String(name).trim(), phone: String(phone).trim(), email: String(email).trim(),
+    method: "alipay", paymentGateway: "alipay", amount, orderBump: Boolean(orderBump),
+    paymentPayload: { items: safeItems, currency: storeCurrency }, status: "pending"
+  });
+  order.paymentInvoiceId = `ALI-${order.id}`;
+  await order.save();
+
+  const subject = String(safeItems[0]?.title || settings.ebook.title || "Digital product").slice(0, 128);
+  const checkoutUrl = alipay.pageExecute("alipay.trade.page.pay", "GET", {
+    returnUrl: `${backendUrl}/api/alipay/return`,
+    notifyUrl: `${backendUrl}/api/alipay/notify`,
+    bizContent: {
+      out_trade_no: order.id,
+      product_code: "FAST_INSTANT_TRADE_PAY",
+      subject,
+      total_amount: amount.toFixed(2),
+      currency: storeCurrency
+    }
+  });
+  res.status(201).json({ orderId: order.id, checkoutUrl });
+});
+
+async function confirmAlipayPayment(params) {
+  const alipay = getAlipayClient();
+  if (!alipay || !alipay.checkNotifySignV2(params)) return { valid: false };
+  if (!["TRADE_SUCCESS", "TRADE_FINISHED"].includes(String(params.trade_status))) return { valid: true, paid: false };
+  const order = await Order.findById(params.out_trade_no);
+  if (!order || order.paymentGateway !== "alipay") return { valid: false };
+  if (Number(params.total_amount) !== Number(order.amount)) return { valid: false };
+
+  const alreadyApproved = order.status === "approved";
+  order.status = "approved";
+  order.transactionId = String(params.trade_no || order.transactionId);
+  order.paymentPayload = { ...(order.paymentPayload || {}), alipay: params };
+  if (!order.downloadToken) order.downloadToken = createDownloadToken(order.id);
+  await order.save();
+  if (!alreadyApproved) await sendDeliveryForApprovedOrder(order, await getSettings());
+  return { valid: true, paid: true, order };
+}
+
+app.post("/api/alipay/notify", express.urlencoded({ extended: false }), async (req, res) => {
+  try {
+    const result = await confirmAlipayPayment(req.body);
+    if (!result.valid) return res.status(400).send("failure");
+    return res.type("text").send("success");
+  } catch (error) {
+    console.error("Alipay notification failed:", error);
+    return res.status(500).send("failure");
+  }
+});
+
+app.get("/api/alipay/return", async (req, res) => {
+  try {
+    const result = await confirmAlipayPayment(req.query);
+    const orderId = encodeURIComponent(String(req.query.out_trade_no || ""));
+    return res.redirect(`${storefrontUrl}/payment-${result.valid && result.paid ? "success" : "failed"}?order_id=${orderId}`);
+  } catch (error) {
+    console.error("Alipay return handling failed:", error);
+    return res.redirect(`${storefrontUrl}/payment-failed`);
+  }
 });
 
 app.get("/api/orders/:id/payment-status", async (req, res) => {

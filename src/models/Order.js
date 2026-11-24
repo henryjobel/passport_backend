@@ -7,7 +7,7 @@ const orderSchema = new Schema(
     name: { type: String, required: true },
     phone: { type: String, required: true },
     email: { type: String, default: "" },
-    method: { type: String, enum: ["bkash", "nagad", "uddoktapay"], required: true },
+    method: { type: String, enum: ["bkash", "nagad", "uddoktapay", "alipay"], required: true },
     transactionId: { type: String, default: "" },
     paymentGateway: { type: String, default: "manual" },
     paymentInvoiceId: { type: String, default: "" },
