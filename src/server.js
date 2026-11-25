@@ -1,7 +1,7 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
-import { randomUUID } from "node:crypto";
+import { createPrivateKey, randomUUID } from "node:crypto";
 import jwt from "jsonwebtoken";
 import { isValidObjectId } from "mongoose";
 import multer from "multer";
@@ -25,7 +25,7 @@ const isProduction = process.env.NODE_ENV === "production";
 const defaultProductionBackendUrl = "https://passport-backend-khaki.vercel.app";
 const backendUrl = process.env.BACKEND_URL || (isProduction ? defaultProductionBackendUrl : `http://localhost:${port}`);
 const storefrontUrl = process.env.FRONTEND_URL || process.env.CLIENT_URL || "http://localhost:5173";
-const storeCurrency = String(process.env.STORE_CURRENCY || "USD").toUpperCase();
+const storeCurrency = String(process.env.STORE_CURRENCY || "CNY").toUpperCase();
 const configuredAllowedOrigins = String(process.env.CLIENT_URL || process.env.FRONTEND_URL || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -75,6 +75,14 @@ function formatAlipayKey(value, label) {
   return `-----BEGIN ${label}-----\n${body.match(/.{1,64}/g)?.join("\n") || body}\n-----END ${label}-----`;
 }
 
+function getAlipayPrivateKey() {
+  const value = String(process.env.ALIPAY_PRIVATE_KEY || "").trim().replace(/\\n/g, "\n");
+  const key = value.includes("-----BEGIN")
+    ? createPrivateKey(value)
+    : createPrivateKey({ key: Buffer.from(value.replace(/\s/g, ""), "base64"), format: "der", type: "pkcs8" });
+  return key.export({ format: "pem", type: "pkcs8" }).toString();
+}
+
 function isAlipayConfigured() {
   const appId = String(process.env.ALIPAY_APP_ID || "").trim();
   const privateKey = formatAlipayKey(process.env.ALIPAY_PRIVATE_KEY, "PRIVATE KEY");
@@ -93,7 +101,10 @@ function getAlipayClient() {
   if (!isAlipayConfigured()) return null;
   return new AlipaySdk({
     appId: process.env.ALIPAY_APP_ID,
-    privateKey: formatAlipayKey(process.env.ALIPAY_PRIVATE_KEY, "PRIVATE KEY"),
+    // Alipay Dashboard can export the application private key as raw DER
+    // base64. Normalize it as PKCS#8 PEM before the SDK signs requests.
+    privateKey: getAlipayPrivateKey(),
+    keyType: "PKCS8",
     alipayPublicKey: formatAlipayKey(process.env.ALIPAY_PUBLIC_KEY, "PUBLIC KEY"),
     signType: "RSA2",
     gateway: process.env.ALIPAY_GATEWAY || "https://openapi.alipay.com/gateway.do"
